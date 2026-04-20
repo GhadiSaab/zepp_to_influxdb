@@ -101,11 +101,15 @@ def extract_sleep_data(ts, slp, day):
     '''
     rows = []
     row = {
-        "timestamp": int(ts) * 1000000000, # Convert to nanos 
+        "timestamp": int(ts) * 1000000000, # Convert to nanos
         "fields" : {
             "total_sleep_min" : slp['lt']+slp['dp'],
             "deep_sleep_min" : slp['dp'],
-            "rem_sleep_min" : slp['lt'],
+            "light_sleep_min" : slp['lt'],
+            "rem_sleep_min" : slp.get('dt', 0),
+            "wake_min" : slp.get('wk', 0),
+            "sleep_score" : slp.get('ss'),
+            "sleep_hr" : slp.get('rhr'),
             "slept_from" : str(datetime.datetime.fromtimestamp(slp['st'])),
             "slept_to" : str(datetime.datetime.fromtimestamp(slp['ed'])),
             },
