@@ -737,6 +737,50 @@ def get_stress_data(auth_info, config):
 
     return rows
 
+def get_charge_data(auth_info, config):
+    ''' Retrieve Charge (body energy) data — per-minute total/mental/physical scores
+    '''
+    rows = []
+
+    today = datetime.datetime.today()
+    today_end = datetime.datetime.combine(today, datetime.datetime.max.time())
+    query_start_d = today - datetime.timedelta(days=config['QUERY_DURATION'])
+    query_start = datetime.datetime.combine(query_start_d, datetime.datetime.min.time())
+
+    print("Retrieving charge data")
+    band_data_url = f"https://api-mifit-de2.zepp.com/v2/users/{auth_info['token_info']['user_id']}/events"
+    headers = {'apptoken': auth_info['token_info']['app_token']}
+    data = {
+        'from': query_start.strftime('%s000'),
+        'to': today_end.strftime('%s000'),
+        'eventType': 'Charge',
+        'subType': 'real_data',
+        'limit': 1000,
+    }
+    response = requests.get(band_data_url, params=data, headers=headers)
+    r_json = response.json()
+
+    if 'items' not in r_json:
+        return rows
+
+    for item in r_json['items']:
+        value = item.get('value', {})
+        start_ms = int(value.get('startTime', item.get('timestamp', 0)))
+        for sample in value.get('samples', []):
+            ts_ns = (start_ms + int(sample['s'])) * 1000000
+            rows.append({
+                'timestamp': ts_ns,
+                'fields': {
+                    'charge_total':    int(sample['total']),
+                    'charge_mental':   round(float(sample['mental']), 1),
+                    'charge_physical': round(float(sample['physical']), 1),
+                },
+                'tags': {'charge_type': 'real_data'},
+            })
+
+    return rows
+
+
 def write_results(results, serial, config):
     ''' Open a connection to InfluxDB and write the results in
     '''
@@ -818,8 +862,13 @@ def main():
         result_set = result_set + pai
     except:
         print("Failed to collect PAI information")
-        
-    
+
+    try:
+        charge = get_charge_data(auth_info, config)
+        result_set = result_set + charge
+    except:
+        print("Failed to collect charge data")
+
     # Write into InfluxDB
     write_results(result_set, serial, config)
 
