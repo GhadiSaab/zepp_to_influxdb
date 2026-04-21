@@ -385,63 +385,37 @@ def get_band_data(auth_info, config):
 
 def translate_heartrate_blob(daydata):
     ''' Extract the heart rate data blob from the JSON
-    and convert to a list of stats
-    
+    and convert to a list of stats.
+
+    Older Mi Band devices encode HR as 2-byte big-endian shorts (1 sample per
+    2 bytes). Newer Amazfit devices use 1 byte per minute (1440 bytes = full day).
+    We detect which format is in use by the blob length.
     '''
-    
-    # Create a datetime object from the date specified in JSON
-    # this will be midnight.
+
     nowtime = datetime.datetime.strptime(daydata['date_time'], "%Y-%m-%d")
-        
     number_blob = bytearray(base64.b64decode(daydata['data_hr']))
-    #print(number_blob)
     adjusted_vals = []
-    
-    # Initialise values
-    x = 1
-    b=b''    
-   
-    # Iterate through the bytestring
-    for byte_i in number_blob:
-        # iterating over leads to us fetching ints
-        # not bytes, so convert back
-        byte = byte_i.to_bytes(length=1, byteorder="big")
-        
-        # Concatenate this byte onto the previous
-        b += byte
-        
-        # Move the marker to the right
-        x += 1
-        
-        # The data is a java short, so every
-        # 2 bytes, convert it to an integer
-        if x == 2:            
-            # Convert the bytestring to an int
-            v = int(b.hex(), 16)
-            
-            # Adjust the timestamp forward 1 minute
-            nowtime = nowtime + datetime.timedelta(minutes=1)
-            
-            # They seem to use a high initialisation
-            # value to indicate lack of data. If it's
-            # higher than 200 skip it
-            if v < 200:
-                # Append a point
-                adjusted_vals.append({
-                        "timestamp": int(nowtime.strftime('%s')) * 1000000000, # Convert to nanos
-                        "fields" : {
-                            "heart_rate" : int(v),
-                            },
-                        "tags" : {
-                            "hr_measure" : "periodic"
-                            }
-                    })
-                
-            
-            # Reset the byte string
-            b = b''
-            # Reset the counter
-            x = 1
+
+    # 1440 bytes = 1 byte per minute for a full day (Amazfit Active 2 and similar)
+    # Otherwise fall back to the original 2-byte Java short encoding (older Mi Band)
+    bytes_per_sample = 1 if len(number_blob) == 1440 else 2
+
+    for i in range(0, len(number_blob), bytes_per_sample):
+        chunk = number_blob[i:i + bytes_per_sample]
+        if len(chunk) < bytes_per_sample:
+            break
+
+        v = chunk[0] if bytes_per_sample == 1 else int.from_bytes(chunk, 'big')
+
+        nowtime = nowtime + datetime.timedelta(minutes=1)
+
+        # Values >= 200 indicate no data
+        if v < 200:
+            adjusted_vals.append({
+                "timestamp": int(nowtime.strftime('%s')) * 1000000000,
+                "fields": {"heart_rate": int(v)},
+                "tags": {"hr_measure": "periodic"},
+            })
 
     return adjusted_vals
     
@@ -737,8 +711,12 @@ def get_stress_data(auth_info, config):
 
     return rows
 
-def get_charge_data(auth_info, config):
-    ''' Retrieve Charge (body energy) data — per-minute total/mental/physical scores
+def get_readiness_data(auth_info, config):
+    ''' Retrieve Amazfit readiness scores, HRV, and insight data.
+
+    The `readiness` event type returns one record per sleep session and
+    includes sleepHRV (raw ms value), hrvScore, rdnsScore (overall readiness),
+    and per-pillar scores/baselines (physical, mental, RHR, AHI, afib).
     '''
     rows = []
 
@@ -747,14 +725,13 @@ def get_charge_data(auth_info, config):
     query_start_d = today - datetime.timedelta(days=config['QUERY_DURATION'])
     query_start = datetime.datetime.combine(query_start_d, datetime.datetime.min.time())
 
-    print("Retrieving charge data")
-    band_data_url = f"https://api-mifit-de2.zepp.com/v2/users/{auth_info['token_info']['user_id']}/events"
+    print("Retrieving readiness / HRV data")
+    band_data_url = f"https://api-mifit.zepp.com/users/{auth_info['token_info']['user_id']}/events"
     headers = {'apptoken': auth_info['token_info']['app_token']}
     data = {
         'from': query_start.strftime('%s000'),
         'to': today_end.strftime('%s000'),
-        'eventType': 'Charge',
-        'subType': 'real_data',
+        'eventType': 'readiness',
         'limit': 1000,
     }
     response = requests.get(band_data_url, params=data, headers=headers)
@@ -763,19 +740,62 @@ def get_charge_data(auth_info, config):
     if 'items' not in r_json:
         return rows
 
+    def safe_int(v, sentinel=255):
+        try:
+            i = int(v)
+            return None if i == sentinel else i
+        except (TypeError, ValueError):
+            return None
+
+    def safe_float(v, sentinel=255):
+        try:
+            f = float(v)
+            return None if f == sentinel else f
+        except (TypeError, ValueError):
+            return None
+
     for item in r_json['items']:
-        value = item.get('value', {})
-        start_ms = int(value.get('startTime', item.get('timestamp', 0)))
-        for sample in value.get('samples', []):
-            ts_ns = (start_ms + int(sample['s'])) * 1000000
+        ts_ns = int(item['timestamp']) * 1000000
+
+        fields = {}
+
+        hrv = safe_int(item.get('sleepHRV'))
+        if hrv is not None:
+            fields['sleep_hrv_ms'] = hrv
+
+        rhr = safe_int(item.get('sleepRHR'))
+        if rhr is not None:
+            fields['sleep_rhr'] = rhr
+
+        for score_key, field_name in [
+            ('rdnsScore',   'readiness_score'),
+            ('hrvScore',    'hrv_score'),
+            ('phyScore',    'physical_score'),
+            ('mentScore',   'mental_score'),
+            ('rhrScore',    'rhr_score'),
+            ('ahiScore',    'ahi_score'),
+            ('afibScore',   'afib_score'),
+        ]:
+            v = safe_int(item.get(score_key))
+            if v is not None:
+                fields[field_name] = v
+
+        for baseline_key, field_name in [
+            ('hrvBaseline',      'hrv_baseline'),
+            ('phyBaseline',      'physical_baseline'),
+            ('mentBaseLine',     'mental_baseline'),
+            ('rhrBaseline',      'rhr_baseline'),
+            ('ahiBaseline',      'ahi_baseline'),
+        ]:
+            v = safe_float(item.get(baseline_key))
+            if v is not None:
+                fields[field_name] = v
+
+        if fields:
             rows.append({
                 'timestamp': ts_ns,
-                'fields': {
-                    'charge_total':    int(sample['total']),
-                    'charge_mental':   round(float(sample['mental']), 1),
-                    'charge_physical': round(float(sample['physical']), 1),
-                },
-                'tags': {'charge_type': 'real_data'},
+                'fields': fields,
+                'tags': {'readiness_type': item.get('subType', 'watch_score')},
             })
 
     return rows
@@ -864,10 +884,10 @@ def main():
         print("Failed to collect PAI information")
 
     try:
-        charge = get_charge_data(auth_info, config)
-        result_set = result_set + charge
+        readiness = get_readiness_data(auth_info, config)
+        result_set = result_set + readiness
     except:
-        print("Failed to collect charge data")
+        print("Failed to collect readiness / HRV data")
 
     # Write into InfluxDB
     write_results(result_set, serial, config)
